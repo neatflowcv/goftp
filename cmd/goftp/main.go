@@ -21,6 +21,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"goftp/internal/pkg/ftp"
 )
 
 type config struct {
@@ -149,7 +151,7 @@ func (s *server) handle(conn net.Conn) {
 	s.log.Printf("client connected: %s", remote)
 	defer s.log.Printf("client disconnected: %s", remote)
 
-	sess.reply(220, "Go FTP server ready")
+	sess.reply(ftp.ReplyServiceReady, "Go FTP server ready")
 	for {
 		line, err := sess.reader.ReadString('\n')
 		if err != nil {
@@ -165,7 +167,7 @@ func (s *server) handle(conn net.Conn) {
 
 		cmd, arg := splitCommand(line)
 		if !sess.loggedIn && !isPreLoginCommand(cmd) {
-			sess.reply(530, "Please login with USER and PASS")
+			sess.reply(ftp.ReplyNotLoggedIn, "Please login with USER and PASS")
 			continue
 		}
 
@@ -197,18 +199,18 @@ func (s *session) handleCommand(cmd, arg string) bool {
 	case "USER":
 		s.user = arg
 		s.loggedIn = false
-		s.reply(331, "Password required")
+		s.reply(ftp.ReplyUserNameOKNeedPassword, "Password required")
 	case "PASS":
 		if s.authOK(arg) {
 			s.loggedIn = true
-			s.reply(230, "Login successful")
+			s.reply(ftp.ReplyUserLoggedIn, "Login successful")
 		} else {
-			s.reply(530, "Login incorrect")
+			s.reply(ftp.ReplyNotLoggedIn, "Login incorrect")
 		}
 	case "SYST":
-		s.reply(215, "UNIX Type: L8")
+		s.reply(ftp.ReplySystemType, "UNIX Type: L8")
 	case "FEAT":
-		s.replyLines(211, []string{
+		s.replyLines(ftp.ReplySystemStatus, []string{
 			"Features:",
 			" EPSV",
 			" PASV",
@@ -219,14 +221,14 @@ func (s *session) handleCommand(cmd, arg string) bool {
 		})
 	case "OPTS":
 		if strings.EqualFold(arg, "UTF8 ON") {
-			s.reply(200, "UTF8 enabled")
+			s.reply(ftp.ReplyCommandOK, "UTF8 enabled")
 		} else {
-			s.reply(502, "Option not implemented")
+			s.reply(ftp.ReplyCommandNotImplemented, "Option not implemented")
 		}
 	case "NOOP":
-		s.reply(200, "OK")
+		s.reply(ftp.ReplyCommandOK, "OK")
 	case "PWD", "XPWD":
-		s.reply(257, fmt.Sprintf("\"%s\" is the current directory", s.cwd))
+		s.reply(ftp.ReplyPathnameCreated, fmt.Sprintf("\"%s\" is the current directory", s.cwd))
 	case "TYPE":
 		s.setType(arg)
 	case "CWD":
@@ -260,10 +262,10 @@ func (s *session) handleCommand(cmd, arg string) bool {
 	case "RNTO":
 		s.renameToCommand(arg)
 	case "QUIT":
-		s.reply(221, "Goodbye")
+		s.reply(ftp.ReplyServiceClosing, "Goodbye")
 		return true
 	default:
-		s.reply(502, "Command not implemented")
+		s.reply(ftp.ReplyCommandNotImplemented, "Command not implemented")
 	}
 	return false
 }
@@ -281,16 +283,16 @@ func (s *session) authOK(pass string) bool {
 func (s *session) setType(arg string) {
 	fields := strings.Fields(arg)
 	if len(fields) == 0 {
-		s.reply(501, "Missing type")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing type")
 		return
 	}
 	typ := strings.ToUpper(fields[0])
 	switch typ {
 	case "A", "I":
 		s.transfer = typ
-		s.reply(200, "Type set")
+		s.reply(ftp.ReplyCommandOK, "Type set")
 	default:
-		s.reply(504, "Unsupported type")
+		s.reply(ftp.ReplyCommandParameterNotImplemented, "Unsupported type")
 	}
 }
 
@@ -301,20 +303,20 @@ func (s *session) cwdCommand(arg string) {
 	virt := s.cleanVirtual(arg)
 	real, err := s.realPath(virt, true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	info, err := os.Stat(real)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if !info.IsDir() {
-		s.reply(550, "Not a directory")
+		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a directory")
 		return
 	}
 	s.cwd = virt
-	s.reply(250, "Directory changed")
+	s.reply(ftp.ReplyRequestedFileActionOK, "Directory changed")
 }
 
 func (s *session) enterPassive(epsv bool) {
@@ -322,7 +324,7 @@ func (s *session) enterPassive(epsv bool) {
 
 	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
-		s.reply(425, "Cannot open passive connection")
+		s.reply(ftp.ReplyCannotOpenDataConnection, "Cannot open passive connection")
 		return
 	}
 	s.pasv = ln
@@ -330,7 +332,7 @@ func (s *session) enterPassive(epsv bool) {
 	tcpAddr := ln.Addr().(*net.TCPAddr)
 	port := tcpAddr.Port
 	if epsv {
-		s.reply(229, fmt.Sprintf("Entering Extended Passive Mode (|||%d|)", port))
+		s.reply(ftp.ReplyEnteringExtendedPassiveMode, fmt.Sprintf("Entering Extended Passive Mode (|||%d|)", port))
 		return
 	}
 
@@ -340,13 +342,13 @@ func (s *session) enterPassive(epsv bool) {
 	}
 	ip := net.ParseIP(host).To4()
 	if ip == nil {
-		s.reply(425, "PASV requires an IPv4 pasv-host")
+		s.reply(ftp.ReplyCannotOpenDataConnection, "PASV requires an IPv4 pasv-host")
 		s.closePassive()
 		return
 	}
 	p1 := port / 256
 	p2 := port % 256
-	s.reply(227, fmt.Sprintf("Entering Passive Mode (%d,%d,%d,%d,%d,%d)", ip[0], ip[1], ip[2], ip[3], p1, p2))
+	s.reply(ftp.ReplyEnteringPassiveMode, fmt.Sprintf("Entering Passive Mode (%d,%d,%d,%d,%d,%d)", ip[0], ip[1], ip[2], ip[3], p1, p2))
 }
 
 func listenerHost(listenerAddr, localAddr net.Addr) string {
@@ -374,13 +376,13 @@ func (s *session) list(arg string, long bool) {
 	virt := s.cleanVirtual(target)
 	real, err := s.realPath(virt, true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 
 	info, err := os.Stat(real)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 
@@ -388,7 +390,7 @@ func (s *session) list(arg string, long bool) {
 		return
 	}
 
-	s.reply(150, "Opening data connection")
+	s.reply(ftp.ReplyFileStatusOK, "Opening data connection")
 	conn, ok := s.acceptData()
 	if !ok {
 		return
@@ -403,36 +405,36 @@ func (s *session) list(arg string, long bool) {
 		_, err = fmt.Fprintf(conn, "%s\r\n", info.Name())
 	}
 	if err != nil {
-		s.reply(426, "Transfer aborted")
+		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
 		return
 	}
-	s.reply(226, "Transfer complete")
+	s.reply(ftp.ReplyClosingDataConnection, "Transfer complete")
 }
 
 func (s *session) retrieve(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	real, err := s.realPath(s.cleanVirtual(arg), true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	file, err := os.Open(real)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if info.IsDir() {
-		s.reply(550, "Not a file")
+		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a file")
 		return
 	}
 
@@ -440,7 +442,7 @@ func (s *session) retrieve(arg string) {
 		return
 	}
 
-	s.reply(150, "Opening data connection")
+	s.reply(ftp.ReplyFileStatusOK, "Opening data connection")
 	conn, ok := s.acceptData()
 	if !ok {
 		return
@@ -448,15 +450,15 @@ func (s *session) retrieve(arg string) {
 	defer conn.Close()
 
 	if _, err := io.Copy(conn, file); err != nil {
-		s.reply(426, "Transfer aborted")
+		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
 		return
 	}
-	s.reply(226, "Transfer complete")
+	s.reply(ftp.ReplyClosingDataConnection, "Transfer complete")
 }
 
 func (s *session) store(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	if !s.hasPassive() {
@@ -465,18 +467,18 @@ func (s *session) store(arg string) {
 	virt := s.cleanVirtual(arg)
 	real, err := s.realPathForCreate(virt)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 
 	file, err := os.OpenFile(real, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	defer file.Close()
 
-	s.reply(150, "Opening data connection")
+	s.reply(ftp.ReplyFileStatusOK, "Opening data connection")
 	conn, ok := s.acceptData()
 	if !ok {
 		return
@@ -484,138 +486,138 @@ func (s *session) store(arg string) {
 	defer conn.Close()
 
 	if _, err := io.Copy(file, conn); err != nil {
-		s.reply(426, "Transfer aborted")
+		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
 		return
 	}
-	s.reply(226, "Transfer complete")
+	s.reply(ftp.ReplyClosingDataConnection, "Transfer complete")
 }
 
 func (s *session) deleteFile(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	real, err := s.realPath(s.cleanVirtual(arg), true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	info, err := os.Stat(real)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if info.IsDir() {
-		s.reply(550, "Use RMD for directories")
+		s.reply(ftp.ReplyRequestedActionNotTaken, "Use RMD for directories")
 		return
 	}
 	if err := os.Remove(real); err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
-	s.reply(250, "File deleted")
+	s.reply(ftp.ReplyRequestedFileActionOK, "File deleted")
 }
 
 func (s *session) makeDir(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	virt := s.cleanVirtual(arg)
 	real, err := s.realPathForCreate(virt)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if err := os.Mkdir(real, 0o755); err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
-	s.reply(257, fmt.Sprintf("\"%s\" created", virt))
+	s.reply(ftp.ReplyPathnameCreated, fmt.Sprintf("\"%s\" created", virt))
 }
 
 func (s *session) removeDir(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	real, err := s.realPath(s.cleanVirtual(arg), true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if err := os.Remove(real); err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
-	s.reply(250, "Directory removed")
+	s.reply(ftp.ReplyRequestedFileActionOK, "Directory removed")
 }
 
 func (s *session) size(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	real, err := s.realPath(s.cleanVirtual(arg), true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	info, err := os.Stat(real)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if info.IsDir() {
-		s.reply(550, "Not a file")
+		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a file")
 		return
 	}
-	s.reply(213, strconv.FormatInt(info.Size(), 10))
+	s.reply(ftp.ReplyFileStatus, strconv.FormatInt(info.Size(), 10))
 }
 
 func (s *session) modifiedTime(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	real, err := s.realPath(s.cleanVirtual(arg), true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	info, err := os.Stat(real)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
-	s.reply(213, info.ModTime().UTC().Format("20060102150405"))
+	s.reply(ftp.ReplyFileStatus, info.ModTime().UTC().Format("20060102150405"))
 }
 
 func (s *session) renameFromCommand(arg string) {
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	real, err := s.realPath(s.cleanVirtual(arg), true)
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if _, err := os.Stat(real); err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	s.renameFrom = real
-	s.reply(350, "Ready for RNTO")
+	s.reply(ftp.ReplyRequestedFileActionPending, "Ready for RNTO")
 }
 
 func (s *session) renameToCommand(arg string) {
 	if s.renameFrom == "" {
-		s.reply(503, "Use RNFR first")
+		s.reply(ftp.ReplyBadCommandSequence, "Use RNFR first")
 		return
 	}
 	if arg == "" {
-		s.reply(501, "Missing path")
+		s.reply(ftp.ReplySyntaxErrorInParameters, "Missing path")
 		return
 	}
 	defer func() {
@@ -624,14 +626,14 @@ func (s *session) renameToCommand(arg string) {
 
 	real, err := s.realPathForCreate(s.cleanVirtual(arg))
 	if err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
 	if err := os.Rename(s.renameFrom, real); err != nil {
-		s.reply(550, err.Error())
+		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 		return
 	}
-	s.reply(250, "Rename successful")
+	s.reply(ftp.ReplyRequestedFileActionOK, "Rename successful")
 }
 
 func (s *session) writeDirList(w io.Writer, real string, long bool) error {
@@ -675,7 +677,7 @@ func formatListLine(name string, info os.FileInfo) string {
 
 func (s *session) acceptData() (net.Conn, bool) {
 	if s.pasv == nil {
-		s.reply(425, "Use PASV or EPSV first")
+		s.reply(ftp.ReplyCannotOpenDataConnection, "Use PASV or EPSV first")
 		return nil, false
 	}
 	ln := s.pasv
@@ -687,7 +689,7 @@ func (s *session) acceptData() (net.Conn, bool) {
 	}
 	conn, err := ln.Accept()
 	if err != nil {
-		s.reply(425, "Cannot open data connection")
+		s.reply(ftp.ReplyCannotOpenDataConnection, "Cannot open data connection")
 		return nil, false
 	}
 	return conn, true
@@ -695,7 +697,7 @@ func (s *session) acceptData() (net.Conn, bool) {
 
 func (s *session) hasPassive() bool {
 	if s.pasv == nil {
-		s.reply(425, "Use PASV or EPSV first")
+		s.reply(ftp.ReplyCannotOpenDataConnection, "Use PASV or EPSV first")
 		return false
 	}
 	return true
@@ -769,12 +771,12 @@ func insideRoot(root, candidate string) bool {
 	return strings.HasPrefix(candidate, sepRoot)
 }
 
-func (s *session) reply(code int, msg string) {
+func (s *session) reply(code ftp.ReplyCode, msg string) {
 	fmt.Fprintf(s.writer, "%d %s\r\n", code, msg)
 	_ = s.writer.Flush()
 }
 
-func (s *session) replyLines(code int, lines []string) {
+func (s *session) replyLines(code ftp.ReplyCode, lines []string) {
 	if len(lines) == 0 {
 		s.reply(code, "")
 		return
