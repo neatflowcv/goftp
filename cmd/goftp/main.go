@@ -187,7 +187,7 @@ func splitCommand(line string) (string, string) {
 
 func isPreLoginCommand(cmd string) bool {
 	switch cmd {
-	case "USER", "PASS", "QUIT", "SYST", "FEAT", "NOOP":
+	case ftp.CommandUser, ftp.CommandPass, ftp.CommandQuit, ftp.CommandSystem, ftp.CommandFeat, ftp.CommandNoop:
 		return true
 	default:
 		return false
@@ -196,20 +196,20 @@ func isPreLoginCommand(cmd string) bool {
 
 func (s *session) handleCommand(cmd, arg string) bool {
 	switch cmd {
-	case "USER":
+	case ftp.CommandUser:
 		s.user = arg
 		s.loggedIn = false
 		s.reply(ftp.ReplyUserNameOKNeedPassword, "Password required")
-	case "PASS":
+	case ftp.CommandPass:
 		if s.authOK(arg) {
 			s.loggedIn = true
 			s.reply(ftp.ReplyUserLoggedIn, "Login successful")
 		} else {
 			s.reply(ftp.ReplyNotLoggedIn, "Login incorrect")
 		}
-	case "SYST":
+	case ftp.CommandSystem:
 		s.reply(ftp.ReplySystemType, "UNIX Type: L8")
-	case "FEAT":
+	case ftp.CommandFeat:
 		s.replyLines(ftp.ReplySystemStatus, []string{
 			"Features:",
 			" EPSV",
@@ -219,49 +219,49 @@ func (s *session) handleCommand(cmd, arg string) bool {
 			" UTF8",
 			"End",
 		})
-	case "OPTS":
+	case ftp.CommandOpts:
 		if strings.EqualFold(arg, "UTF8 ON") {
 			s.reply(ftp.ReplyCommandOK, "UTF8 enabled")
 		} else {
 			s.reply(ftp.ReplyCommandNotImplemented, "Option not implemented")
 		}
-	case "NOOP":
+	case ftp.CommandNoop:
 		s.reply(ftp.ReplyCommandOK, "OK")
-	case "PWD", "XPWD":
+	case ftp.CommandPrintWorkingDirectory, ftp.CommandXPrintWorkingDirectory:
 		s.reply(ftp.ReplyPathnameCreated, fmt.Sprintf("\"%s\" is the current directory", s.cwd))
-	case "TYPE":
+	case ftp.CommandType:
 		s.setType(arg)
-	case "CWD":
+	case ftp.CommandChangeWorkingDirectory:
 		s.cwdCommand(arg)
-	case "CDUP":
+	case ftp.CommandChangeToParent:
 		s.cwdCommand("..")
-	case "PASV":
+	case ftp.CommandPassive:
 		s.enterPassive(false)
-	case "EPSV":
+	case ftp.CommandExtendedPassive:
 		s.enterPassive(true)
-	case "LIST":
+	case ftp.CommandList:
 		s.list(arg, true)
-	case "NLST":
+	case ftp.CommandNameList:
 		s.list(arg, false)
-	case "RETR":
+	case ftp.CommandRetrieve:
 		s.retrieve(arg)
-	case "STOR":
+	case ftp.CommandStore:
 		s.store(arg)
-	case "DELE":
+	case ftp.CommandDelete:
 		s.deleteFile(arg)
-	case "MKD", "XMKD":
+	case ftp.CommandMakeDirectory, ftp.CommandXMakeDirectory:
 		s.makeDir(arg)
-	case "RMD", "XRMD":
+	case ftp.CommandRemoveDir, ftp.CommandXRemoveDir:
 		s.removeDir(arg)
-	case "SIZE":
+	case ftp.CommandSize:
 		s.size(arg)
-	case "MDTM":
+	case ftp.CommandModifiedTime:
 		s.modifiedTime(arg)
-	case "RNFR":
+	case ftp.CommandRenameFrom:
 		s.renameFromCommand(arg)
-	case "RNTO":
+	case ftp.CommandRenameTo:
 		s.renameToCommand(arg)
-	case "QUIT":
+	case ftp.CommandQuit:
 		s.reply(ftp.ReplyServiceClosing, "Goodbye")
 		return true
 	default:

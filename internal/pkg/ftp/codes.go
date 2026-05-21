@@ -1,5 +1,49 @@
 package ftp
 
+// Command is an FTP control connection command name.
+//
+// Commands are conventionally sent as uppercase ASCII tokens. See the IANA FTP
+// Commands and Extensions registry for the current command and extension
+// registry:
+// https://www.iana.org/assignments/ftp-commands-extensions/ftp-commands-extensions.xhtml
+type Command = string
+
+const (
+	CommandUser Command = "USER"
+	CommandPass Command = "PASS"
+	CommandQuit Command = "QUIT"
+
+	CommandSystem Command = "SYST"
+	CommandFeat   Command = "FEAT"
+	CommandOpts   Command = "OPTS"
+	CommandNoop   Command = "NOOP"
+
+	CommandPrintWorkingDirectory  Command = "PWD"
+	CommandXPrintWorkingDirectory Command = "XPWD"
+	CommandChangeWorkingDirectory Command = "CWD"
+	CommandChangeToParent         Command = "CDUP"
+
+	CommandType            Command = "TYPE"
+	CommandPassive         Command = "PASV"
+	CommandExtendedPassive Command = "EPSV"
+
+	CommandList     Command = "LIST"
+	CommandNameList Command = "NLST"
+	CommandRetrieve Command = "RETR"
+	CommandStore    Command = "STOR"
+	CommandDelete   Command = "DELE"
+
+	CommandMakeDirectory  Command = "MKD"
+	CommandXMakeDirectory Command = "XMKD"
+	CommandRemoveDir      Command = "RMD"
+	CommandXRemoveDir     Command = "XRMD"
+
+	CommandSize         Command = "SIZE"
+	CommandModifiedTime Command = "MDTM"
+	CommandRenameFrom   Command = "RNFR"
+	CommandRenameTo     Command = "RNTO"
+)
+
 // ReplyCode is a three-digit FTP control connection reply code.
 //
 // See RFC 959 section 4.2.1 for the base FTP reply codes. RFC 959 is still
