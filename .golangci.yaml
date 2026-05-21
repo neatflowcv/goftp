@@ -1,0 +1,15 @@
+version: "2"
+linters:
+  default: all
+  disable:
+    - revive
+    - depguard
+    - wsl # deprecated
+    - gomodguard # deprecated
+    - tagliatelle # 외부 서비스 반환 형식을 그대로 사용해야 한다.
+    - ireturn # nolint 쓸때 버그 존재해서 걍 무시
+    - prealloc # 그냥 내 스타일이 아님
+    - varnamelen # 한글자도 의미가 있는게 많다
+    - wrapcheck # 너무 과하다
+    - gosec # 임시
+    - mnd # 임시

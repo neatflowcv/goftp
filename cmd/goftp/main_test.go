@@ -4,10 +4,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 )
 
 func TestSplitCommand(t *testing.T) {
+	t.Parallel()
+
 	cmd, arg := splitCommand("user  alice  ")
 	if cmd != "USER" || arg != "alice" {
 		t.Fatalf("splitCommand returned %q, %q", cmd, arg)
@@ -20,6 +23,8 @@ func TestSplitCommand(t *testing.T) {
 }
 
 func TestRealPathStaysInsideRoot(t *testing.T) {
+	t.Parallel()
+
 	root := t.TempDir()
 	s := testSession(t, root)
 
@@ -27,6 +32,7 @@ func TestRealPathStaysInsideRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	want := filepath.Join(root, "etc", "passwd")
 	if got != want {
 		t.Fatalf("expected traversal to stay under root as %q, got %q", want, got)
@@ -36,48 +42,66 @@ func TestRealPathStaysInsideRoot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := file.Close(); err != nil {
+
+	err = file.Close()
+	if err != nil {
 		t.Fatal(err)
 	}
+
 	got, err = s.realPath("/file.txt", true)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if got != filepath.Join(root, "file.txt") {
 		t.Fatalf("expected file path inside root, got %q", got)
 	}
 }
 
 func TestRealPathRejectsSymlinkEscape(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	t.Parallel()
+
+	if runtime.GOOS == goosWindows {
 		t.Skip("symlink permissions vary on Windows")
 	}
 
 	root := t.TempDir()
+
 	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(root, "outside")); err != nil {
+
+	err := os.Symlink(outside, filepath.Join(root, "outside"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	s := testSession(t, root)
-	if _, err := s.realPath("/outside", true); err == nil {
+
+	_, err = s.realPath("/outside", true)
+	if err == nil {
 		t.Fatal("expected symlink escape to be rejected")
 	}
 }
 
 func TestRealPathForCreateRejectsSymlinkParentEscape(t *testing.T) {
-	if runtime.GOOS == "windows" {
+	t.Parallel()
+
+	if runtime.GOOS == goosWindows {
 		t.Skip("symlink permissions vary on Windows")
 	}
 
 	root := t.TempDir()
+
 	outside := t.TempDir()
-	if err := os.Symlink(outside, filepath.Join(root, "outside")); err != nil {
+
+	err := os.Symlink(outside, filepath.Join(root, "outside"))
+	if err != nil {
 		t.Fatal(err)
 	}
 
 	s := testSession(t, root)
-	if _, err := s.realPathForCreate("/outside/new.txt"); err == nil {
+
+	_, err = s.realPathForCreate("/outside/new.txt")
+	if err == nil {
 		t.Fatal("expected symlink parent escape to be rejected")
 	}
 }
@@ -89,10 +113,29 @@ func testSession(t *testing.T, root string) *session {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	return &session{
 		srv: &server{
+			cfg: config{
+				addr:     "",
+				root:     "",
+				user:     "",
+				pass:     "",
+				pasvHost: "",
+			},
 			rootAbs: rootAbs,
+			ln:      nil,
+			log:     nil,
+			wg:      sync.WaitGroup{},
 		},
-		cwd: "/",
+		conn:       nil,
+		reader:     nil,
+		writer:     nil,
+		user:       "",
+		loggedIn:   false,
+		cwd:        "/",
+		transfer:   "",
+		pasv:       nil,
+		renameFrom: "",
 	}
 }
