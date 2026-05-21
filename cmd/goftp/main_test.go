@@ -6,6 +6,8 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+
+	"goftp/internal/pkg/auth/static"
 )
 
 func TestSplitCommand(t *testing.T) {
@@ -123,10 +125,11 @@ func testSession(t *testing.T, root string) *session {
 				pass:     "",
 				pasvHost: "",
 			},
-			rootAbs: rootAbs,
-			ln:      nil,
-			log:     nil,
-			wg:      sync.WaitGroup{},
+			authenticator: static.NewStaticAuthenticator("", ""),
+			rootAbs:       rootAbs,
+			ln:            nil,
+			log:           nil,
+			wg:            sync.WaitGroup{},
 		},
 		conn:       nil,
 		reader:     nil,

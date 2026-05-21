@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"crypto/subtle"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,6 +21,8 @@ import (
 	"syscall"
 	"time"
 
+	"goftp/internal/pkg/auth"
+	"goftp/internal/pkg/auth/static"
 	"goftp/internal/pkg/ftp"
 )
 
@@ -42,11 +43,12 @@ type config struct {
 }
 
 type server struct {
-	cfg     config
-	rootAbs string
-	ln      net.Listener
-	log     *log.Logger
-	wg      sync.WaitGroup
+	cfg           config
+	authenticator auth.Authenticator
+	rootAbs       string
+	ln            net.Listener
+	log           *log.Logger
+	wg            sync.WaitGroup
 }
 
 type session struct {
@@ -108,11 +110,12 @@ func run(cfg config) error {
 	}
 
 	srv := &server{
-		cfg:     cfg,
-		rootAbs: rootAbs,
-		ln:      ln,
-		log:     log.New(os.Stdout, "goftp: ", log.LstdFlags),
-		wg:      sync.WaitGroup{},
+		cfg:           cfg,
+		authenticator: static.NewStaticAuthenticator(cfg.user, cfg.pass),
+		rootAbs:       rootAbs,
+		ln:            ln,
+		log:           log.New(os.Stdout, "goftp: ", log.LstdFlags),
+		wg:            sync.WaitGroup{},
 	}
 
 	errCh := make(chan error, 1)
@@ -302,15 +305,11 @@ func (s *session) handleCommand(cmd, arg string) bool { //nolint:cyclop,funlen
 }
 
 func (s *session) authOK(pass string) bool {
-	if s.srv.cfg.user != "" && s.user != s.srv.cfg.user {
+	if s.srv.authenticator == nil {
 		return false
 	}
 
-	if s.srv.cfg.pass == "" {
-		return true
-	}
-
-	return subtle.ConstantTimeCompare([]byte(pass), []byte(s.srv.cfg.pass)) == 1
+	return s.srv.authenticator.Authenticate(s.user, pass)
 }
 
 func (s *session) setType(arg string) {
