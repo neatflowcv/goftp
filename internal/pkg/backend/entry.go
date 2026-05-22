@@ -1,24 +1,31 @@
 package backend
 
 import (
-	"io/fs"
 	"time"
+)
+
+// EntryKind describes the kind of a backend entry.
+type EntryKind int
+
+const (
+	EntryKindFile EntryKind = iota
+	EntryKindDirectory
 )
 
 // Entry is backend-neutral metadata for files and directories.
 type Entry struct {
 	name    string
 	size    int64
-	mode    fs.FileMode
+	kind    EntryKind
 	modTime time.Time
 }
 
 // NewEntry creates immutable backend-neutral metadata for a file or directory.
-func NewEntry(name string, size int64, mode fs.FileMode, modTime time.Time) *Entry {
+func NewEntry(name string, size int64, kind EntryKind, modTime time.Time) *Entry {
 	return &Entry{
 		name:    name,
 		size:    size,
-		mode:    mode,
+		kind:    kind,
 		modTime: modTime,
 	}
 }
@@ -33,9 +40,9 @@ func (e *Entry) Size() int64 {
 	return e.size
 }
 
-// Mode returns the entry mode.
-func (e *Entry) Mode() fs.FileMode {
-	return e.mode
+// Kind returns the entry kind.
+func (e *Entry) Kind() EntryKind {
+	return e.kind
 }
 
 // ModTime returns the entry modification time.
@@ -45,5 +52,5 @@ func (e *Entry) ModTime() time.Time {
 
 // IsDir reports whether the entry describes a directory.
 func (e *Entry) IsDir() bool {
-	return e.mode.IsDir()
+	return e.kind == EntryKindDirectory
 }

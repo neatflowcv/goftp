@@ -742,16 +742,14 @@ func (s *session) writeDirList(w io.Writer, virtualPath string, long bool) error
 }
 
 func formatListLine(name string, entry *backend.Entry) string {
-	mode := entry.Mode()
-
 	fileType := "-"
-	if mode.IsDir() {
+	perms := "rw-r--r--"
+
+	if entry.IsDir() {
 		fileType = "d"
-	} else if mode&os.ModeSymlink != 0 {
-		fileType = "l"
+		perms = "rwxr-xr-x"
 	}
 
-	perms := mode.Perm().String()[1:]
 	mtime := entry.ModTime().Format("Jan _2 15:04")
 
 	return fmt.Sprintf("%s%s 1 owner group %12d %s %s\r\n", fileType, perms, entry.Size(), mtime, name)

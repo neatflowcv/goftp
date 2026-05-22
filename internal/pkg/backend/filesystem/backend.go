@@ -22,6 +22,7 @@ var (
 	errParentNotDirectory = errors.New("parent is not a directory")
 	errPathEscapesRoot    = errors.New("path escapes FTP root")
 	errRootNotDirectory   = errors.New("root is not a directory")
+	errUnsupportedEntry   = errors.New("unsupported entry type")
 )
 
 var _ backend.Backend = (*Backend)(nil)
@@ -72,7 +73,12 @@ func (b *Backend) Stat(ctx context.Context, virtualPath string) (*backend.Entry,
 		return nil, err
 	}
 
-	return entryFromFileInfo(info), nil
+	entry, ok := entryFromFileInfo(info)
+	if !ok {
+		return nil, errUnsupportedEntry
+	}
+
+	return entry, nil
 }
 
 // List returns child entries for a directory.
@@ -112,7 +118,12 @@ func (b *Backend) List(ctx context.Context, virtualPath string) ([]*backend.Entr
 			return nil, err
 		}
 
-		entries = append(entries, entryFromFileInfo(info))
+		entry, ok := entryFromFileInfo(info)
+		if !ok {
+			continue
+		}
+
+		entries = append(entries, entry)
 	}
 
 	return entries, nil
@@ -245,8 +256,15 @@ func (b *Backend) Rename(ctx context.Context, fromPath, toPath string) error {
 	return os.Rename(from, to)
 }
 
-func entryFromFileInfo(info os.FileInfo) *backend.Entry {
-	return backend.NewEntry(info.Name(), info.Size(), info.Mode(), info.ModTime())
+func entryFromFileInfo(info os.FileInfo) (*backend.Entry, bool) {
+	switch {
+	case info.Mode().IsRegular():
+		return backend.NewEntry(info.Name(), info.Size(), backend.EntryKindFile, info.ModTime()), true
+	case info.IsDir():
+		return backend.NewEntry(info.Name(), info.Size(), backend.EntryKindDirectory, info.ModTime()), true
+	default:
+		return nil, false
+	}
 }
 
 func (b *Backend) realPath(virtualPath string) (string, error) {
