@@ -23,6 +23,15 @@ type config struct {
 }
 
 func main() {
+	cfg := LoadConfig()
+
+	err := run(cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
+}
+
+func LoadConfig() *config {
 	var cfg config
 	flag.StringVar(&cfg.addr, "addr", "127.0.0.1:2121", "control address to listen on")
 	flag.StringVar(&cfg.root, "root", ".", "directory exposed as FTP root")
@@ -31,13 +40,10 @@ func main() {
 	flag.StringVar(&cfg.pasvHost, "pasv-host", "", "host/IP advertised for passive transfers; defaults to control listener host") //nolint:lll
 	flag.Parse()
 
-	err := run(cfg)
-	if err != nil {
-		log.Fatal(err)
-	}
+	return &cfg
 }
 
-func run(cfg config) error {
+func run(cfg *config) error {
 	storage, err := filesystem.NewFilesystemBackend(cfg.root)
 	if err != nil {
 		return err
