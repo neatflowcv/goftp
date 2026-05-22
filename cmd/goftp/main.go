@@ -40,9 +40,13 @@ type server struct {
 	ln            net.Listener
 	log           *log.Logger
 	wg            sync.WaitGroup
+	mu            sync.Mutex
+	sessions      map[*session]struct{}
+	closing       bool
 }
 
 type session struct {
+	mu         sync.Mutex
 	srv        *server
 	conn       net.Conn
 	reader     *bufio.Reader
@@ -52,6 +56,7 @@ type session struct {
 	cwd        string
 	transfer   string
 	pasv       net.Listener
+	data       net.Conn
 	renameFrom string
 }
 
@@ -93,6 +98,9 @@ func run(cfg config) error {
 		ln:            ln,
 		log:           log.New(os.Stdout, "goftp: ", log.LstdFlags),
 		wg:            sync.WaitGroup{},
+		mu:            sync.Mutex{},
+		sessions:      make(map[*session]struct{}),
+		closing:       false,
 	}
 
 	errCh := make(chan error, 1)
@@ -104,12 +112,15 @@ func run(cfg config) error {
 
 	select {
 	case <-ctx.Done():
-		_ = ln.Close()
+		srv.shutdown()
 
 		srv.wg.Wait()
 
 		return nil
 	case err := <-errCh:
+		srv.shutdown()
+		srv.wg.Wait()
+
 		return err
 	}
 }
@@ -125,18 +136,22 @@ func (s *server) serve() error {
 			return err
 		}
 
+		sess := s.newSession(conn)
+		if !s.registerSession(sess) {
+			sess.close()
+
+			continue
+		}
+
 		s.wg.Go(func() {
-			s.handle(conn)
+			s.handle(sess)
 		})
 	}
 }
 
-func (s *server) handle(conn net.Conn) {
-	defer func() {
-		_ = conn.Close()
-	}()
-
-	sess := &session{
+func (s *server) newSession(conn net.Conn) *session {
+	return &session{
+		mu:         sync.Mutex{},
 		srv:        s,
 		conn:       conn,
 		reader:     bufio.NewReader(conn),
@@ -146,11 +161,59 @@ func (s *server) handle(conn net.Conn) {
 		cwd:        "/",
 		transfer:   "A",
 		pasv:       nil,
+		data:       nil,
 		renameFrom: "",
 	}
-	defer sess.closePassive()
+}
 
-	remote := conn.RemoteAddr().String()
+func (s *server) registerSession(sess *session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.closing {
+		return false
+	}
+
+	if s.sessions == nil {
+		s.sessions = make(map[*session]struct{})
+	}
+
+	s.sessions[sess] = struct{}{}
+
+	return true
+}
+
+func (s *server) unregisterSession(sess *session) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.sessions, sess)
+}
+
+func (s *server) shutdown() {
+	s.mu.Lock()
+	s.closing = true
+
+	sessions := make([]*session, 0, len(s.sessions))
+	for sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+
+	_ = s.ln.Close()
+
+	for _, sess := range sessions {
+		sess.close()
+	}
+}
+
+func (s *server) handle(sess *session) {
+	defer func() {
+		s.unregisterSession(sess)
+		sess.close()
+	}()
+
+	remote := sess.conn.RemoteAddr().String()
 
 	s.log.Printf("client connected: %s", remote)
 	defer s.log.Printf("client disconnected: %s", remote)
@@ -343,7 +406,7 @@ func (s *session) enterPassive(epsv bool) {
 		return
 	}
 
-	s.pasv = ln
+	s.setPassive(ln)
 
 	tcpAddr, ok := ln.Addr().(*net.TCPAddr)
 	if !ok {
@@ -423,6 +486,7 @@ func (s *session) list(arg string, long bool) {
 		return
 	}
 	defer func() {
+		s.clearData(conn)
 		_ = conn.Close()
 	}()
 
@@ -494,6 +558,7 @@ func (s *session) retrieve(arg string) {
 		return
 	}
 	defer func() {
+		s.clearData(conn)
 		_ = conn.Close()
 	}()
 
@@ -541,6 +606,7 @@ func (s *session) store(arg string) {
 		return
 	}
 	defer func() {
+		s.clearData(conn)
 		_ = conn.Close()
 	}()
 
@@ -756,14 +822,12 @@ func formatListLine(name string, entry *backend.Entry) string {
 }
 
 func (s *session) acceptData() (net.Conn, bool) {
-	if s.pasv == nil {
+	ln := s.takePassive()
+	if ln == nil {
 		s.reply(ftp.ReplyCannotOpenDataConnection, "Use PASV or EPSV first")
 
 		return nil, false
 	}
-
-	ln := s.pasv
-	s.pasv = nil
 
 	defer func() {
 		_ = ln.Close()
@@ -780,11 +844,17 @@ func (s *session) acceptData() (net.Conn, bool) {
 		return nil, false
 	}
 
+	s.setData(conn)
+
 	return conn, true
 }
 
 func (s *session) hasPassive() bool {
-	if s.pasv == nil {
+	s.mu.Lock()
+	hasPassive := s.pasv != nil
+	s.mu.Unlock()
+
+	if !hasPassive {
 		s.reply(ftp.ReplyCannotOpenDataConnection, "Use PASV or EPSV first")
 
 		return false
@@ -793,10 +863,63 @@ func (s *session) hasPassive() bool {
 	return true
 }
 
+func (s *session) close() {
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+
+	s.closePassive()
+	s.closeData()
+}
+
+func (s *session) setPassive(ln net.Listener) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.pasv = ln
+}
+
+func (s *session) takePassive() net.Listener {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	ln := s.pasv
+	s.pasv = nil
+
+	return ln
+}
+
+func (s *session) setData(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.data = conn
+}
+
+func (s *session) clearData(conn net.Conn) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.data == conn {
+		s.data = nil
+	}
+}
+
 func (s *session) closePassive() {
-	if s.pasv != nil {
-		_ = s.pasv.Close()
-		s.pasv = nil
+	ln := s.takePassive()
+	if ln != nil {
+		_ = ln.Close()
+	}
+}
+
+func (s *session) closeData() {
+	s.mu.Lock()
+	conn := s.data
+	s.data = nil
+	s.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
 	}
 }
 

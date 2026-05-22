@@ -3,13 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"io"
 	"log"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"goftp/internal/pkg/auth/static"
 	"goftp/internal/pkg/backend/filesystem"
@@ -34,6 +35,7 @@ func TestCleanVirtual(t *testing.T) {
 	t.Parallel()
 
 	s := &session{
+		mu:         sync.Mutex{},
 		srv:        nil,
 		conn:       nil,
 		reader:     (*bufio.Reader)(nil),
@@ -43,6 +45,7 @@ func TestCleanVirtual(t *testing.T) {
 		cwd:        "/docs",
 		transfer:   "",
 		pasv:       nil,
+		data:       nil,
 		renameFrom: "",
 	}
 
@@ -84,20 +87,8 @@ func TestStorePreflightFailureRepliesBeforeTransfer(t *testing.T) {
 	var out bytes.Buffer
 
 	s := &session{
-		srv: &server{
-			cfg: config{
-				addr:     "",
-				root:     "",
-				user:     "",
-				pass:     "",
-				pasvHost: "",
-			},
-			authenticator: static.NewStaticAuthenticator("", ""),
-			backend:       storage,
-			ln:            nil,
-			log:           log.New(os.Stdout, "", 0),
-			wg:            sync.WaitGroup{},
-		},
+		mu:         sync.Mutex{},
+		srv:        newTestServer(storage, nil),
 		conn:       nil,
 		reader:     (*bufio.Reader)(nil),
 		writer:     bufio.NewWriter(&out),
@@ -106,6 +97,7 @@ func TestStorePreflightFailureRepliesBeforeTransfer(t *testing.T) {
 		cwd:        "/",
 		transfer:   "",
 		pasv:       pasv,
+		data:       nil,
 		renameFrom: "",
 	}
 
@@ -120,5 +112,116 @@ func TestStorePreflightFailureRepliesBeforeTransfer(t *testing.T) {
 
 	if strings.HasPrefix(got, strconv.Itoa(int(ftp.ReplyFileStatusOK))) {
 		t.Fatalf("store replied with transfer-start before preflight failure: %q", got)
+	}
+}
+
+func TestServerShutdownClosesActiveSession(t *testing.T) {
+	t.Parallel()
+
+	storage, err := filesystem.NewFilesystemBackend(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var lc net.ListenConfig
+
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestServer(storage, ln)
+
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.serve()
+	}()
+
+	var dialer net.Dialer
+
+	conn, err := dialer.DialContext(t.Context(), "tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+
+	reader := bufio.NewReader(conn)
+
+	greeting, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.HasPrefix(greeting, strconv.Itoa(int(ftp.ReplyServiceReady))) {
+		t.Fatalf("greeting = %q, want service-ready reply", greeting)
+	}
+
+	srv.shutdown()
+
+	assertServeReturned(t, serveErr)
+	assertServerSessionsClosed(t, srv)
+	assertControlConnectionClosed(t, conn, reader)
+}
+
+func newTestServer(storage *filesystem.Backend, ln net.Listener) *server {
+	return &server{
+		cfg: config{
+			addr:     "",
+			root:     "",
+			user:     "",
+			pass:     "",
+			pasvHost: "",
+		},
+		authenticator: static.NewStaticAuthenticator("", ""),
+		backend:       storage,
+		ln:            ln,
+		log:           log.New(io.Discard, "", 0),
+		wg:            sync.WaitGroup{},
+		mu:            sync.Mutex{},
+		sessions:      make(map[*session]struct{}),
+		closing:       false,
+	}
+}
+
+func assertServeReturned(t *testing.T, serveErr <-chan error) {
+	t.Helper()
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("serve returned %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serve did not return after shutdown")
+	}
+}
+
+func assertServerSessionsClosed(t *testing.T, srv *server) {
+	t.Helper()
+
+	waitDone := make(chan struct{})
+
+	go func() {
+		srv.wg.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("active session did not exit after shutdown")
+	}
+}
+
+func assertControlConnectionClosed(t *testing.T, conn net.Conn, reader *bufio.Reader) {
+	t.Helper()
+
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+
+	_, err := reader.ReadString('\n')
+	if err == nil {
+		t.Fatal("client control connection remained readable after shutdown")
 	}
 }
