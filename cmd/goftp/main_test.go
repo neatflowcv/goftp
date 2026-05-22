@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
+	"log"
+	"net"
 	"os"
-	"path/filepath"
-	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
 	"goftp/internal/pkg/auth/static"
+	"goftp/internal/pkg/backend/filesystem"
+	"goftp/internal/pkg/ftp"
 )
 
 func TestSplitCommand(t *testing.T) {
@@ -24,99 +30,60 @@ func TestSplitCommand(t *testing.T) {
 	}
 }
 
-func TestRealPathStaysInsideRoot(t *testing.T) {
+func TestCleanVirtual(t *testing.T) {
 	t.Parallel()
 
-	root := t.TempDir()
-	s := testSession(t, root)
-
-	got, err := s.realPath(s.cleanVirtual("../../etc/passwd"), false)
-	if err != nil {
-		t.Fatal(err)
+	s := &session{
+		srv:        nil,
+		conn:       nil,
+		reader:     (*bufio.Reader)(nil),
+		writer:     (*bufio.Writer)(nil),
+		user:       "",
+		loggedIn:   false,
+		cwd:        "/docs",
+		transfer:   "",
+		pasv:       nil,
+		renameFrom: "",
 	}
 
-	want := filepath.Join(root, "etc", "passwd")
-	if got != want {
-		t.Fatalf("expected traversal to stay under root as %q, got %q", want, got)
+	tests := map[string]string{
+		"":                 "/docs",
+		"file.txt":         "/docs/file.txt",
+		"../file.txt":      "/file.txt",
+		"../../file.txt":   "/file.txt",
+		"/absolute.txt":    "/absolute.txt",
+		"/nested/../a.txt": "/a.txt",
 	}
 
-	file, err := os.Create(filepath.Join(root, "file.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = file.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	got, err = s.realPath("/file.txt", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if got != filepath.Join(root, "file.txt") {
-		t.Fatalf("expected file path inside root, got %q", got)
+	for input, want := range tests {
+		got := s.cleanVirtual(input)
+		if got != want {
+			t.Fatalf("cleanVirtual(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 
-func TestRealPathRejectsSymlinkEscape(t *testing.T) {
+func TestStorePreflightFailureRepliesBeforeTransfer(t *testing.T) {
 	t.Parallel()
 
-	if runtime.GOOS == goosWindows {
-		t.Skip("symlink permissions vary on Windows")
-	}
-
-	root := t.TempDir()
-
-	outside := t.TempDir()
-
-	err := os.Symlink(outside, filepath.Join(root, "outside"))
+	storage, err := filesystem.NewFilesystemBackend(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	s := testSession(t, root)
+	var lc net.ListenConfig
 
-	_, err = s.realPath("/outside", true)
-	if err == nil {
-		t.Fatal("expected symlink escape to be rejected")
-	}
-}
-
-func TestRealPathForCreateRejectsSymlinkParentEscape(t *testing.T) {
-	t.Parallel()
-
-	if runtime.GOOS == goosWindows {
-		t.Skip("symlink permissions vary on Windows")
-	}
-
-	root := t.TempDir()
-
-	outside := t.TempDir()
-
-	err := os.Symlink(outside, filepath.Join(root, "outside"))
+	pasv, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() {
+		_ = pasv.Close()
+	}()
 
-	s := testSession(t, root)
+	var out bytes.Buffer
 
-	_, err = s.realPathForCreate("/outside/new.txt")
-	if err == nil {
-		t.Fatal("expected symlink parent escape to be rejected")
-	}
-}
-
-func testSession(t *testing.T, root string) *session {
-	t.Helper()
-
-	rootAbs, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	return &session{
+	s := &session{
 		srv: &server{
 			cfg: config{
 				addr:     "",
@@ -126,19 +93,32 @@ func testSession(t *testing.T, root string) *session {
 				pasvHost: "",
 			},
 			authenticator: static.NewStaticAuthenticator("", ""),
-			rootAbs:       rootAbs,
+			backend:       storage,
 			ln:            nil,
-			log:           nil,
+			log:           log.New(os.Stdout, "", 0),
 			wg:            sync.WaitGroup{},
 		},
 		conn:       nil,
-		reader:     nil,
-		writer:     nil,
+		reader:     (*bufio.Reader)(nil),
+		writer:     bufio.NewWriter(&out),
 		user:       "",
-		loggedIn:   false,
+		loggedIn:   true,
 		cwd:        "/",
 		transfer:   "",
-		pasv:       nil,
+		pasv:       pasv,
 		renameFrom: "",
+	}
+
+	s.store("/missing/file.txt")
+
+	got := out.String()
+
+	wantPrefix := "550 "
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("store reply = %q, want prefix %q", got, wantPrefix)
+	}
+
+	if strings.HasPrefix(got, strconv.Itoa(int(ftp.ReplyFileStatusOK))) {
+		t.Fatalf("store replied with transfer-start before preflight failure: %q", got)
 	}
 }

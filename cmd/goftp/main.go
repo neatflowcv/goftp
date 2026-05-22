@@ -12,9 +12,6 @@ import (
 	"os"
 	"os/signal"
 	"path"
-	"path/filepath"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,15 +20,9 @@ import (
 
 	"goftp/internal/pkg/auth"
 	"goftp/internal/pkg/auth/static"
+	"goftp/internal/pkg/backend"
+	"goftp/internal/pkg/backend/filesystem"
 	"goftp/internal/pkg/ftp"
-)
-
-const goosWindows = "windows"
-
-var (
-	errParentNotDirectory = errors.New("parent is not a directory")
-	errPathEscapesRoot    = errors.New("path escapes FTP root")
-	errRootNotDirectory   = errors.New("root is not a directory")
 )
 
 type config struct {
@@ -45,7 +36,7 @@ type config struct {
 type server struct {
 	cfg           config
 	authenticator auth.Authenticator
-	rootAbs       string
+	backend       backend.Backend
 	ln            net.Listener
 	log           *log.Logger
 	wg            sync.WaitGroup
@@ -80,23 +71,9 @@ func main() {
 }
 
 func run(cfg config) error {
-	rootAbs, err := filepath.Abs(cfg.root)
+	storage, err := filesystem.NewFilesystemBackend(cfg.root)
 	if err != nil {
 		return err
-	}
-
-	rootAbs, err = filepath.EvalSymlinks(rootAbs)
-	if err != nil {
-		return fmt.Errorf("resolve root: %w", err)
-	}
-
-	info, err := os.Stat(rootAbs)
-	if err != nil {
-		return fmt.Errorf("stat root: %w", err)
-	}
-
-	if !info.IsDir() {
-		return fmt.Errorf("%w: %s", errRootNotDirectory, rootAbs)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -112,7 +89,7 @@ func run(cfg config) error {
 	srv := &server{
 		cfg:           cfg,
 		authenticator: static.NewStaticAuthenticator(cfg.user, cfg.pass),
-		rootAbs:       rootAbs,
+		backend:       storage,
 		ln:            ln,
 		log:           log.New(os.Stdout, "goftp: ", log.LstdFlags),
 		wg:            sync.WaitGroup{},
@@ -123,7 +100,7 @@ func run(cfg config) error {
 		errCh <- srv.serve()
 	}()
 
-	srv.log.Printf("listening on %s, root=%s", ln.Addr(), rootAbs)
+	srv.log.Printf("listening on %s, root=%s", ln.Addr(), cfg.root)
 
 	select {
 	case <-ctx.Done():
@@ -337,21 +314,14 @@ func (s *session) cwdCommand(arg string) {
 
 	virt := s.cleanVirtual(arg)
 
-	fsPath, err := s.realPath(virt, true)
+	entry, err := s.srv.backend.Stat(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	info, err := os.Stat(fsPath)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	if !info.IsDir() {
+	if !entry.IsDir() {
 		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a directory")
 
 		return
@@ -435,14 +405,7 @@ func (s *session) list(arg string, long bool) {
 
 	virt := s.cleanVirtual(target)
 
-	fsPath, err := s.realPath(virt, true)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	info, err := os.Stat(fsPath)
+	entry, err := s.srv.backend.Stat(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
@@ -463,7 +426,7 @@ func (s *session) list(arg string, long bool) {
 		_ = conn.Close()
 	}()
 
-	err = s.writeListTarget(conn, fsPath, info, long)
+	err = s.writeListTarget(conn, virt, entry, long)
 	if err != nil {
 		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
 
@@ -473,16 +436,16 @@ func (s *session) list(arg string, long bool) {
 	s.reply(ftp.ReplyClosingDataConnection, "Transfer complete")
 }
 
-func (s *session) writeListTarget(w io.Writer, fsPath string, info os.FileInfo, long bool) error {
+func (s *session) writeListTarget(w io.Writer, virtualPath string, entry *backend.Entry, long bool) error {
 	switch {
-	case info.IsDir():
-		return s.writeDirList(w, fsPath, long)
+	case entry.IsDir():
+		return s.writeDirList(w, virtualPath, long)
 	case long:
-		_, err := fmt.Fprint(w, formatListLine(info.Name(), info))
+		_, err := fmt.Fprint(w, formatListLine(entry.Name(), entry))
 
 		return err
 	default:
-		_, err := fmt.Fprintf(w, "%s\r\n", info.Name())
+		_, err := fmt.Fprintf(w, "%s\r\n", entry.Name())
 
 		return err
 	}
@@ -495,35 +458,30 @@ func (s *session) retrieve(arg string) {
 		return
 	}
 
-	fsPath, err := s.realPath(s.cleanVirtual(arg), true)
+	virt := s.cleanVirtual(arg)
+
+	entry, err := s.srv.backend.Stat(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	file, err := os.Open(fsPath)
+	if entry.IsDir() {
+		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a file")
+
+		return
+	}
+
+	reader, err := s.srv.backend.OpenReader(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 	defer func() {
-		_ = file.Close()
+		_ = reader.Close()
 	}()
-
-	info, err := file.Stat()
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	if info.IsDir() {
-		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a file")
-
-		return
-	}
 
 	if !s.hasPassive() {
 		return
@@ -539,7 +497,7 @@ func (s *session) retrieve(arg string) {
 		_ = conn.Close()
 	}()
 
-	_, err = io.Copy(conn, file)
+	_, err = io.Copy(conn, reader)
 	if err != nil {
 		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
 
@@ -562,21 +520,18 @@ func (s *session) store(arg string) {
 
 	virt := s.cleanVirtual(arg)
 
-	fsPath, err := s.realPathForCreate(virt)
+	writer, err := s.srv.backend.CreateWriter(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	file, err := os.OpenFile(fsPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
+	closeWriter := true
 	defer func() {
-		_ = file.Close()
+		if closeWriter {
+			_ = writer.Close()
+		}
 	}()
 
 	s.reply(ftp.ReplyFileStatusOK, "Opening data connection")
@@ -589,7 +544,16 @@ func (s *session) store(arg string) {
 		_ = conn.Close()
 	}()
 
-	_, err = io.Copy(file, conn)
+	_, err = io.Copy(writer, conn)
+	if err != nil {
+		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
+
+		return
+	}
+
+	closeWriter = false
+
+	err = writer.Close()
 	if err != nil {
 		s.reply(ftp.ReplyConnectionClosedTransferAbort, "Transfer aborted")
 
@@ -606,27 +570,22 @@ func (s *session) deleteFile(arg string) {
 		return
 	}
 
-	fsPath, err := s.realPath(s.cleanVirtual(arg), true)
+	virt := s.cleanVirtual(arg)
+
+	entry, err := s.srv.backend.Stat(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	info, err := os.Stat(fsPath)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	if info.IsDir() {
+	if entry.IsDir() {
 		s.reply(ftp.ReplyRequestedActionNotTaken, "Use RMD for directories")
 
 		return
 	}
 
-	err = os.Remove(fsPath)
+	err = s.srv.backend.DeleteFile(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
@@ -645,14 +604,7 @@ func (s *session) makeDir(arg string) {
 
 	virt := s.cleanVirtual(arg)
 
-	fsPath, err := s.realPathForCreate(virt)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	err = os.Mkdir(fsPath, 0o755)
+	err := s.srv.backend.MakeDir(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
@@ -669,14 +621,7 @@ func (s *session) removeDir(arg string) {
 		return
 	}
 
-	fsPath, err := s.realPath(s.cleanVirtual(arg), true)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	err = os.Remove(fsPath)
+	err := s.srv.backend.RemoveDir(context.Background(), s.cleanVirtual(arg))
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
@@ -693,27 +638,20 @@ func (s *session) size(arg string) {
 		return
 	}
 
-	fsPath, err := s.realPath(s.cleanVirtual(arg), true)
+	entry, err := s.srv.backend.Stat(context.Background(), s.cleanVirtual(arg))
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	info, err := os.Stat(fsPath)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	if info.IsDir() {
+	if entry.IsDir() {
 		s.reply(ftp.ReplyRequestedActionNotTaken, "Not a file")
 
 		return
 	}
 
-	s.reply(ftp.ReplyFileStatus, strconv.FormatInt(info.Size(), 10))
+	s.reply(ftp.ReplyFileStatus, strconv.FormatInt(entry.Size(), 10))
 }
 
 func (s *session) modifiedTime(arg string) {
@@ -723,21 +661,14 @@ func (s *session) modifiedTime(arg string) {
 		return
 	}
 
-	fsPath, err := s.realPath(s.cleanVirtual(arg), true)
+	entry, err := s.srv.backend.Stat(context.Background(), s.cleanVirtual(arg))
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	info, err := os.Stat(fsPath)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	s.reply(ftp.ReplyFileStatus, info.ModTime().UTC().Format("20060102150405"))
+	s.reply(ftp.ReplyFileStatus, entry.ModTime().UTC().Format("20060102150405"))
 }
 
 func (s *session) renameFromCommand(arg string) {
@@ -747,21 +678,16 @@ func (s *session) renameFromCommand(arg string) {
 		return
 	}
 
-	fsPath, err := s.realPath(s.cleanVirtual(arg), true)
+	virt := s.cleanVirtual(arg)
+
+	_, err := s.srv.backend.Stat(context.Background(), virt)
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
 		return
 	}
 
-	_, err = os.Stat(fsPath)
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	s.renameFrom = fsPath
+	s.renameFrom = virt
 	s.reply(ftp.ReplyRequestedFileActionPending, "Ready for RNTO")
 }
 
@@ -782,14 +708,7 @@ func (s *session) renameToCommand(arg string) {
 		s.renameFrom = ""
 	}()
 
-	fsPath, err := s.realPathForCreate(s.cleanVirtual(arg))
-	if err != nil {
-		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
-
-		return
-	}
-
-	err = os.Rename(s.renameFrom, fsPath)
+	err := s.srv.backend.Rename(context.Background(), s.renameFrom, s.cleanVirtual(arg))
 	if err != nil {
 		s.reply(ftp.ReplyRequestedActionNotTaken, err.Error())
 
@@ -799,24 +718,15 @@ func (s *session) renameToCommand(arg string) {
 	s.reply(ftp.ReplyRequestedFileActionOK, "Rename successful")
 }
 
-func (s *session) writeDirList(w io.Writer, dirPath string, long bool) error {
-	entries, err := os.ReadDir(dirPath)
+func (s *session) writeDirList(w io.Writer, virtualPath string, long bool) error {
+	entries, err := s.srv.backend.List(context.Background(), virtualPath)
 	if err != nil {
 		return err
 	}
 
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Name() < entries[j].Name()
-	})
-
 	for _, entry := range entries {
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-
 		if long {
-			_, err = fmt.Fprint(w, formatListLine(entry.Name(), info))
+			_, err = fmt.Fprint(w, formatListLine(entry.Name(), entry))
 			if err != nil {
 				return err
 			}
@@ -831,8 +741,8 @@ func (s *session) writeDirList(w io.Writer, dirPath string, long bool) error {
 	return nil
 }
 
-func formatListLine(name string, info os.FileInfo) string {
-	mode := info.Mode()
+func formatListLine(name string, entry *backend.Entry) string {
+	mode := entry.Mode()
 
 	fileType := "-"
 	if mode.IsDir() {
@@ -842,9 +752,9 @@ func formatListLine(name string, info os.FileInfo) string {
 	}
 
 	perms := mode.Perm().String()[1:]
-	mtime := info.ModTime().Format("Jan _2 15:04")
+	mtime := entry.ModTime().Format("Jan _2 15:04")
 
-	return fmt.Sprintf("%s%s 1 owner group %12d %s %s\r\n", fileType, perms, info.Size(), mtime, name)
+	return fmt.Sprintf("%s%s 1 owner group %12d %s %s\r\n", fileType, perms, entry.Size(), mtime, name)
 }
 
 func (s *session) acceptData() (net.Conn, bool) {
@@ -902,70 +812,6 @@ func (s *session) cleanVirtual(arg string) string {
 	}
 
 	return path.Clean(path.Join(s.cwd, arg))
-}
-
-func (s *session) realPath(virt string, mustExist bool) (string, error) {
-	cleanVirt := path.Clean("/" + strings.TrimPrefix(virt, "/"))
-	fsPath := filepath.Join(s.srv.rootAbs, filepath.FromSlash(strings.TrimPrefix(cleanVirt, "/")))
-
-	fsPath = filepath.Clean(fsPath)
-	if mustExist {
-		eval, err := filepath.EvalSymlinks(fsPath)
-		if err != nil {
-			return "", err
-		}
-
-		fsPath = eval
-	}
-
-	if !insideRoot(s.srv.rootAbs, fsPath) {
-		return "", errPathEscapesRoot
-	}
-
-	return fsPath, nil
-}
-
-func (s *session) realPathForCreate(virt string) (string, error) {
-	cleanVirt := path.Clean("/" + strings.TrimPrefix(virt, "/"))
-	parentVirt := path.Dir(cleanVirt)
-
-	parentReal, err := s.realPath(parentVirt, true)
-	if err != nil {
-		return "", err
-	}
-
-	info, err := os.Stat(parentReal)
-	if err != nil {
-		return "", err
-	}
-
-	if !info.IsDir() {
-		return "", errParentNotDirectory
-	}
-
-	fsPath := filepath.Join(parentReal, path.Base(cleanVirt))
-
-	fsPath = filepath.Clean(fsPath)
-	if !insideRoot(s.srv.rootAbs, fsPath) {
-		return "", errPathEscapesRoot
-	}
-
-	return fsPath, nil
-}
-
-func insideRoot(root, candidate string) bool {
-	if runtime.GOOS == goosWindows {
-		root = strings.ToLower(root)
-		candidate = strings.ToLower(candidate)
-	}
-
-	if candidate == root {
-		return true
-	}
-
-	sepRoot := strings.TrimRight(root, string(filepath.Separator)) + string(filepath.Separator)
-
-	return strings.HasPrefix(candidate, sepRoot)
 }
 
 func (s *session) reply(code ftp.ReplyCode, msg string) {
